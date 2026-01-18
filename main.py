@@ -5,14 +5,16 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from html import unescape
 from typing import Any, Dict, List, Optional
 
 import feedparser
 import requests
 from telegram import Update
-from telegram.error import BadRequest, NetworkError
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 
 CONFIG_PATH_ENV = "CONFIG_PATH"
 DEFAULT_CONFIG_PATH = "config.json"
@@ -20,9 +22,118 @@ DEFAULT_CONFIG_PATH = "config.json"
 TAG_RE = re.compile(r"<[^>]+>")
 DEFAULT_MAX_UPLOAD_BYTES = 45 * 1024 * 1024
 DEFAULT_MAX_SOURCE_BYTES = 200 * 1024 * 1024
-DEFAULT_MAX_THUMB_BYTES = 5 * 1024 * 1024
-DEFAULT_TRANSCODE_BITRATE_KBPS = 96
+DEFAULT_MAX_THUMB_BYTES = 15 * 1024 * 1024
+DEFAULT_SEND_ORIGINAL_LINK = True
+DEFAULT_TRANSCODE_HEADROOM = 0.9
+DEFAULT_TRANSCODE_MAX_KBPS = 320
+DEFAULT_TRANSCODE_MIN_KBPS = 8
+THUMB_MAX_BYTES = 200 * 1024
+THUMB_MAX_DIM = 320
+THUMB_QUALITIES = (6, 10, 14, 18, 22, 26, 30)
+THUMB_SIZES = (THUMB_MAX_DIM, 256, 192, 128)
+DEFAULT_SEND_RETRIES = 5
+DEFAULT_SEND_RETRY_BASE_SECONDS = 3
+DEFAULT_PROCESS_ALL_DELAY_SECONDS = 120
+DEFAULT_AUDIO_SEND_MODE = "auto"
+DEFAULT_DOWNLOAD_RETRIES = 3
+DEFAULT_DOWNLOAD_RETRY_BASE_SECONDS = 2
+DEFAULT_DOWNLOAD_TIMEOUT = (10, 60)
 MAX_MESSAGE_LENGTH = 4096
+DEFAULT_LANGUAGE = "ru"
+SUPPORTED_LANGUAGES = ("ru", "en")
+DEFAULT_AUTO_CHECK_ENABLED = True
+DEFAULT_AUTO_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+
+MESSAGES = {
+    "ru": {
+        "id_not_found": "Не удалось получить ваш ID.",
+        "config_read_error": "Ошибка чтения конфига: {error}",
+        "config_missing_channel": "В конфиге не указан channel.",
+        "config_missing_rss_url": "В конфиге не указан rss_url.",
+        "no_access": "Нет доступа.",
+        "searching_new": "Ищу новые выпуски...",
+        "processing_all": "Запускаю обработку всех выпусков...",
+        "done_published": "Готово. Опубликовано: {count}",
+        "error_generic": "Ошибка: {error}",
+        "process_all_reset": "Сбросил process_all_last_id.",
+        "usage_add_admin": "Использование: /add_admin <user_id>",
+        "usage_remove_admin": "Использование: /remove_admin <user_id>",
+        "usage_update_config": "Использование: /update_config ключ:значение",
+        "usage_set_language": "Использование: /set_language en|ru",
+        "invalid_user_id": "Некорректный user_id.",
+        "admin_already": "Этот пользователь уже админ.",
+        "admin_added": "Добавил админа: {user_id}",
+        "admin_missing": "Такого админа нет.",
+        "admin_remove_last": "Нельзя удалить последнего админа.",
+        "admin_removed": "Удалил админа: {user_id}",
+        "admin_ids_list_required": "admin_ids должен быть списком.",
+        "config_key_missing": "Не указан ключ.",
+        "bot_token_updated": "bot_token обновлен. Перезапусти бота.",
+        "config_updated": "Обновил {key}.",
+        "language_set": "Язык переключен на {language}.",
+        "language_unsupported": "Недоступный язык: {language}",
+        "help_title": "Команды:",
+        "fallback_too_large": "Файл слишком большой для загрузки ботом.\n{url}",
+        "original_label": (
+            "Оригинал: {url}\n"
+            "Аудио было сжато из-за ограничения Telegram на размер файлов для ботов."
+        ),
+        "help_myid": "/myid - показывает ваш Telegram ID",
+        "help_new": "/new_podcast - публикует новые выпуски после last_published_id",
+        "help_all": "/process_all_podcast - публикует все выпуски из RSS (от старых к новым)",
+        "help_reset": "/reset_process_all - сбрасывает process_all_last_id для начала заново",
+        "help_add_admin": "/add_admin <user_id> - добавить админа по ID",
+        "help_remove_admin": "/remove_admin <user_id> - удалить админа по ID",
+        "help_update": "/update_config ключ:значение - обновляет поле конфига",
+        "help_set_language": "/set_language en|ru - переключает язык бота",
+        "help_help": "/help - выводит список доступных команд",
+        "myid_reply": "Ваш ID: {user_id}",
+    },
+    "en": {
+        "id_not_found": "Could not get your ID.",
+        "config_read_error": "Config read error: {error}",
+        "config_missing_channel": "channel is not set in config.",
+        "config_missing_rss_url": "rss_url is not set in config.",
+        "no_access": "Access denied.",
+        "searching_new": "Looking for new episodes...",
+        "processing_all": "Processing all episodes...",
+        "done_published": "Done. Published: {count}",
+        "error_generic": "Error: {error}",
+        "process_all_reset": "process_all_last_id reset.",
+        "usage_add_admin": "Usage: /add_admin <user_id>",
+        "usage_remove_admin": "Usage: /remove_admin <user_id>",
+        "usage_update_config": "Usage: /update_config key:value",
+        "usage_set_language": "Usage: /set_language en|ru",
+        "invalid_user_id": "Invalid user_id.",
+        "admin_already": "User is already an admin.",
+        "admin_added": "Added admin: {user_id}",
+        "admin_missing": "Admin not found.",
+        "admin_remove_last": "Cannot remove the last admin.",
+        "admin_removed": "Removed admin: {user_id}",
+        "admin_ids_list_required": "admin_ids must be a list.",
+        "config_key_missing": "Key is required.",
+        "bot_token_updated": "bot_token updated. Restart the bot.",
+        "config_updated": "Updated {key}.",
+        "language_set": "Language set to {language}.",
+        "language_unsupported": "Unsupported language: {language}",
+        "help_title": "Commands:",
+        "fallback_too_large": "File is too large to upload via bot.\n{url}",
+        "original_label": (
+            "Original: {url}\n"
+            "Audio was compressed due to Telegram bot file size limits."
+        ),
+        "help_myid": "/myid - shows your Telegram user ID",
+        "help_new": "/new_podcast - publishes new episodes since last_published_id",
+        "help_all": "/process_all_podcast - publishes all episodes (oldest to newest)",
+        "help_reset": "/reset_process_all - resets process_all_last_id to start over",
+        "help_add_admin": "/add_admin <user_id> - add an admin by ID",
+        "help_remove_admin": "/remove_admin <user_id> - remove an admin by ID",
+        "help_update": "/update_config key:value - updates a config field",
+        "help_set_language": "/set_language en|ru - switches bot language",
+        "help_help": "/help - shows available commands",
+        "myid_reply": "Your ID: {user_id}",
+    },
+}
 FALLBACK_AUDIO_ERRORS = (
     "failed to get http url content",
     "wrong type of the web page content",
@@ -82,6 +193,16 @@ def parse_positive_int(value: Any, default: int) -> int:
     return parsed
 
 
+def parse_non_negative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0:
+        return default
+    return parsed
+
+
 def get_max_upload_bytes(config: Dict[str, Any]) -> int:
     raw_value = config.get("max_upload_mb")
     if raw_value is None:
@@ -108,17 +229,59 @@ def get_max_source_bytes(config: Dict[str, Any]) -> int:
     return int(value * 1024 * 1024)
 
 
-def get_transcode_bitrate_kbps(config: Dict[str, Any]) -> int:
+def get_max_thumb_source_bytes(config: Dict[str, Any]) -> int:
+    raw_value = config.get("max_thumb_source_mb")
+    if raw_value is None:
+        return DEFAULT_MAX_THUMB_BYTES
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_THUMB_BYTES
+    if value <= 0:
+        return DEFAULT_MAX_THUMB_BYTES
+    return int(value * 1024 * 1024)
+
+
+def get_send_original_link(config: Dict[str, Any]) -> bool:
+    return parse_bool(config.get("send_original_link"), DEFAULT_SEND_ORIGINAL_LINK)
+
+
+def get_audio_send_mode(config: Dict[str, Any]) -> str:
+    value = (config.get("audio_send_mode") or "").strip().lower()
+    if value in ("auto", "upload", "url"):
+        return value
+    return DEFAULT_AUDIO_SEND_MODE
+
+
+def get_process_all_delay_seconds(config: Dict[str, Any]) -> int:
+    return parse_non_negative_int(
+        config.get("process_all_delay_seconds"),
+        DEFAULT_PROCESS_ALL_DELAY_SECONDS,
+    )
+
+
+def get_auto_check_enabled(config: Dict[str, Any]) -> bool:
+    return parse_bool(config.get("auto_check_enabled"), DEFAULT_AUTO_CHECK_ENABLED)
+
+
+def get_auto_check_interval_seconds(config: Dict[str, Any]) -> int:
     return parse_positive_int(
-        config.get("transcode_bitrate_kbps"),
-        DEFAULT_TRANSCODE_BITRATE_KBPS,
+        config.get("auto_check_interval_seconds"),
+        DEFAULT_AUTO_CHECK_INTERVAL_SECONDS,
     )
 
 
 def strip_html(text: str) -> str:
     text = unescape(text or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n", text)
+    text = re.sub(r"(?i)<p\s*>", "", text)
+    text = re.sub(r"(?i)</li\s*>", "\n", text)
+    text = re.sub(r"(?i)<li\s*>", "- ", text)
     text = TAG_RE.sub("", text)
-    text = re.sub(r"\s+\n", "\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
@@ -171,37 +334,62 @@ def get_image_url(entry: Dict[str, Any], feed: Dict[str, Any]) -> Optional[str]:
 
 def download_to_temp(url: str, suffix: str, max_bytes: int) -> str:
     headers = {"User-Agent": "tg-podcast-bot/1.0"}
-    with requests.get(url, headers=headers, stream=True, timeout=30) as response:
-        response.raise_for_status()
-        content_length = response.headers.get("Content-Length")
-        if content_length:
-            try:
-                if int(content_length) > max_bytes:
-                    raise AudioTooLargeError(
-                        f"Audio is too large: {content_length} bytes"
-                    )
-            except ValueError:
-                pass
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            try:
-                size = 0
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    size += len(chunk)
-                    if size > max_bytes:
-                        raise AudioTooLargeError(
-                            f"Audio exceeded limit: {size} bytes"
-                        )
-                    tmp.write(chunk)
-                return tmp.name
-            except AudioTooLargeError:
-                tmp.close()
-                try:
-                    os.remove(tmp.name)
-                except OSError:
-                    pass
+    last_exc = None
+    for attempt in range(1, DEFAULT_DOWNLOAD_RETRIES + 1):
+        try:
+            with requests.get(
+                url,
+                headers=headers,
+                stream=True,
+                timeout=DEFAULT_DOWNLOAD_TIMEOUT,
+            ) as response:
+                response.raise_for_status()
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        if int(content_length) > max_bytes:
+                            raise AudioTooLargeError(
+                                f"File is too large: {content_length} bytes"
+                            )
+                    except ValueError:
+                        pass
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    try:
+                        size = 0
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            size += len(chunk)
+                            if size > max_bytes:
+                                raise AudioTooLargeError(
+                                    f"File exceeded limit: {size} bytes"
+                                )
+                            tmp.write(chunk)
+                        return tmp.name
+                    except (AudioTooLargeError, requests.RequestException):
+                        tmp.close()
+                        try:
+                            os.remove(tmp.name)
+                        except OSError:
+                            pass
+                        raise
+        except AudioTooLargeError:
+            raise
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= DEFAULT_DOWNLOAD_RETRIES:
                 raise
+            delay = DEFAULT_DOWNLOAD_RETRY_BASE_SECONDS ** attempt
+            logging.warning(
+                "Download failed: %s. Retrying in %ss (%d/%d).",
+                exc,
+                delay,
+                attempt,
+                DEFAULT_DOWNLOAD_RETRIES,
+            )
+            time.sleep(delay)
+    if last_exc:
+        raise last_exc
 
 
 def transcode_audio(input_path: str, bitrate_kbps: int) -> str:
@@ -228,6 +416,122 @@ def transcode_audio(input_path: str, bitrate_kbps: int) -> str:
     return output.name
 
 
+def create_thumbnail(input_path: str) -> Optional[str]:
+    best_path = None
+    best_size = None
+    for size in THUMB_SIZES:
+        for quality in THUMB_QUALITIES:
+            output = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            output.close()
+            command = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_path,
+                "-vf",
+                (
+                    f"scale='min({size},iw)':'min({size},ih)':"
+                    "force_original_aspect_ratio=decrease"
+                ),
+                "-frames:v",
+                "1",
+                "-q:v",
+                str(quality),
+                "-loglevel",
+                "error",
+                output.name,
+            ]
+            try:
+                subprocess.run(command, check=True)
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    "ffmpeg not found. Install ffmpeg to use thumbnails."
+                ) from exc
+            except subprocess.CalledProcessError:
+                try:
+                    os.remove(output.name)
+                except OSError:
+                    pass
+                continue
+
+            try:
+                size_bytes = os.path.getsize(output.name)
+            except OSError:
+                size_bytes = 0
+            if size_bytes <= 0:
+                try:
+                    os.remove(output.name)
+                except OSError:
+                    pass
+                continue
+
+            if best_size is None or (size_bytes and size_bytes < best_size):
+                if best_path:
+                    try:
+                        os.remove(best_path)
+                    except OSError:
+                        pass
+                best_path = output.name
+                best_size = size_bytes
+            else:
+                try:
+                    os.remove(output.name)
+                except OSError:
+                    pass
+
+            if size_bytes and size_bytes <= THUMB_MAX_BYTES:
+                return best_path
+    if best_path and best_size and best_size <= THUMB_MAX_BYTES:
+        return best_path
+    if best_path:
+        try:
+            os.remove(best_path)
+        except OSError:
+            pass
+    return None
+
+
+def get_audio_duration_seconds(path: str) -> float:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffprobe not found. Install ffmpeg to use transcoding.") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("ffprobe failed to read duration.") from exc
+    output = result.stdout.strip()
+    if not output:
+        raise RuntimeError("ffprobe returned empty duration.")
+    try:
+        return float(output)
+    except ValueError as exc:
+        raise RuntimeError("ffprobe returned invalid duration.") from exc
+
+
+def choose_transcode_bitrate_kbps(duration_seconds: float, max_upload_bytes: int) -> int:
+    target_bits = int(max_upload_bytes * 8 * DEFAULT_TRANSCODE_HEADROOM)
+    bitrate_kbps = int(target_bits / max(duration_seconds, 1.0) / 1000)
+    if bitrate_kbps > DEFAULT_TRANSCODE_MAX_KBPS:
+        return DEFAULT_TRANSCODE_MAX_KBPS
+    if bitrate_kbps < DEFAULT_TRANSCODE_MIN_KBPS:
+        return DEFAULT_TRANSCODE_MIN_KBPS
+    return bitrate_kbps
+
+
 def should_fallback_to_download(error: Exception) -> bool:
     message = str(error).lower()
     return any(token in message for token in FALLBACK_AUDIO_ERRORS)
@@ -236,9 +540,8 @@ def should_fallback_to_download(error: Exception) -> bool:
 def format_text(entry: Dict[str, Any]) -> str:
     title = (entry.get("title") or "").strip()
     summary = strip_html(entry.get("summary") or entry.get("description") or "")
-    link = (entry.get("link") or "").strip()
 
-    parts = [part for part in (title, summary, link) if part]
+    parts = [part for part in (title, summary) if part]
     text = "\n\n".join(parts)
     if len(text) > 3900:
         text = text[:3900].rstrip() + "..."
@@ -248,26 +551,138 @@ def format_text(entry: Dict[str, Any]) -> str:
 def format_caption(entry: Dict[str, Any], max_length: int = 1024) -> str:
     title = (entry.get("title") or "").strip()
     summary = strip_html(entry.get("summary") or entry.get("description") or "")
-    link = (entry.get("link") or "").strip()
 
-    parts = [part for part in (title, summary, link) if part]
+    parts = [part for part in (title, summary) if part]
     text = "\n\n".join(parts)
     if len(text) > max_length:
         text = text[: max_length - 3].rstrip() + "..."
     return text
 
 
-def build_fallback_message(text: str, audio_url: str) -> str:
-    note = (
-        "Файл слишком большой для загрузки ботом.\n"
-        f"{audio_url}"
-    )
+def build_fallback_message(text: str, audio_url: str, language: str) -> str:
+    note = t(language, "fallback_too_large", url=audio_url)
     if not text:
         return note
     combined = f"{text}\n\n{note}"
     if len(combined) > MAX_MESSAGE_LENGTH:
         combined = combined[: MAX_MESSAGE_LENGTH - 3].rstrip() + "..."
     return combined
+
+
+def append_original_link(caption: str, audio_url: str, language: str) -> str:
+    note = t(language, "original_label", url=audio_url)
+    if not caption:
+        combined = note
+    else:
+        combined = f"{caption}\n\n{note}"
+    if len(combined) > 1024:
+        combined = combined[: 1024 - 3].rstrip() + "..."
+    return combined
+
+
+def get_source_size_bytes(source) -> Optional[int]:
+    try:
+        fileno = source.fileno()
+    except Exception:
+        return None
+    try:
+        return os.fstat(fileno).st_size
+    except OSError:
+        return None
+
+
+def parse_config_value(raw_value: str) -> Any:
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return ""
+    if raw_value.lower() in ("true", "false", "null"):
+        try:
+            return json.loads(raw_value.lower())
+        except json.JSONDecodeError:
+            return raw_value
+    if raw_value[0] in "[{\"-0123456789":
+        try:
+            return json.loads(raw_value)
+        except json.JSONDecodeError:
+            return raw_value
+    return raw_value
+
+
+def get_language(config: Dict[str, Any]) -> str:
+    language = (config.get("language") or "").strip().lower()
+    if language in SUPPORTED_LANGUAGES:
+        return language
+    return DEFAULT_LANGUAGE
+
+
+def t(language: str, key: str, **kwargs: Any) -> str:
+    catalog = MESSAGES.get(language) or MESSAGES[DEFAULT_LANGUAGE]
+    template = catalog.get(key) or MESSAGES[DEFAULT_LANGUAGE].get(key, key)
+    return template.format(**kwargs)
+
+
+def normalize_admin_ids(value: Any) -> List[int]:
+    if not isinstance(value, list):
+        return []
+    cleaned: List[int] = []
+    for admin_id in value:
+        try:
+            cleaned.append(int(admin_id))
+        except (TypeError, ValueError):
+            continue
+    return cleaned
+
+
+async def call_with_retry(label: str, call, *args, **kwargs):
+    for attempt in range(1, DEFAULT_SEND_RETRIES + 1):
+        try:
+            return await call(*args, **kwargs)
+        except (TimedOut, NetworkError) as exc:
+            if attempt >= DEFAULT_SEND_RETRIES:
+                raise
+            delay = DEFAULT_SEND_RETRY_BASE_SECONDS ** attempt
+            logging.warning(
+                "%s failed: %s. Retrying in %ss (%d/%d).",
+                label,
+                exc,
+                delay,
+                attempt,
+                DEFAULT_SEND_RETRIES,
+            )
+            await asyncio.sleep(delay)
+
+
+def build_thumbnail(image_url: str, max_bytes: int) -> Optional[str]:
+    try:
+        source_path = download_to_temp(
+            image_url,
+            ".img",
+            max_bytes,
+        )
+    except AudioTooLargeError as exc:
+        logging.warning(
+            "Thumbnail source too large: %s. Trying direct compression.",
+            exc,
+        )
+        try:
+            return create_thumbnail(image_url)
+        except Exception as fallback_exc:
+            logging.warning(
+                "Failed to create thumbnail from URL: %s",
+                fallback_exc,
+            )
+            return None
+    except requests.RequestException as exc:
+        logging.warning("Failed to download thumbnail: %s", exc)
+        return None
+
+    try:
+        return create_thumbnail(source_path)
+    finally:
+        try:
+            os.remove(source_path)
+        except OSError:
+            pass
 
 
 async def publish_entry(
@@ -278,7 +693,10 @@ async def publish_entry(
     max_upload_bytes: int,
     max_source_bytes: int,
     transcode_enabled: bool,
-    transcode_bitrate_kbps: int,
+    send_original_link: bool,
+    audio_send_mode: str,
+    max_thumb_source_bytes: int,
+    language: str,
 ) -> None:
     title = (entry.get("title") or "").strip()
     performer = (feed.get("title") or "").strip() or None
@@ -286,36 +704,67 @@ async def publish_entry(
     if not audio_url:
         raise RuntimeError("Audio URL not found for entry")
 
-    caption = format_caption(entry)
+    base_caption = format_caption(entry)
     text = format_text(entry)
     thumb_path = None
     image_url = get_image_url(entry, feed)
     if image_url:
         try:
             thumb_path = await asyncio.to_thread(
-                download_to_temp,
+                build_thumbnail,
                 image_url,
-                ".jpg",
-                DEFAULT_MAX_THUMB_BYTES,
+                max_thumb_source_bytes,
             )
-        except AudioTooLargeError as exc:
-            logging.warning("Thumbnail too large: %s", exc)
-        except requests.RequestException as exc:
-            logging.warning("Failed to download thumbnail: %s", exc)
+        except Exception as exc:
+            logging.warning("Failed to prepare thumbnail: %s", exc)
 
-    async def send_audio_with(source) -> None:
+    async def send_audio_with(source, caption_text: str) -> None:
         thumb_file = None
+        size_bytes = get_source_size_bytes(source)
         try:
             if thumb_path:
                 thumb_file = open(thumb_path, "rb")
-            await bot.send_audio(
-                chat_id=channel,
-                audio=source,
-                title=title or None,
-                performer=performer,
-                caption=caption or None,
-                thumbnail=thumb_file,
-            )
+            async def send_audio() -> None:
+                if hasattr(source, "seek"):
+                    source.seek(0)
+                start = time.monotonic()
+                try:
+                    await bot.send_audio(
+                        chat_id=channel,
+                        audio=source,
+                        title=title or None,
+                        performer=performer,
+                        caption=caption_text or None,
+                        thumbnail=thumb_file,
+                    )
+                except Exception as exc:
+                    elapsed = time.monotonic() - start
+                    if size_bytes:
+                        logging.warning(
+                            "send_audio failed after %.1fs (upload %.2f MB): %s",
+                            elapsed,
+                            size_bytes / (1024 * 1024),
+                            exc,
+                        )
+                    else:
+                        logging.warning(
+                            "send_audio failed after %.1fs (source=url): %s",
+                            elapsed,
+                            exc,
+                        )
+                    raise
+                else:
+                    elapsed = time.monotonic() - start
+                    if size_bytes:
+                        logging.info(
+                            "send_audio ok in %.1fs (upload %.2f MB).",
+                            elapsed,
+                            size_bytes / (1024 * 1024),
+                        )
+                    else:
+                        logging.info("send_audio ok in %.1fs (source=url).", elapsed)
+
+            await call_with_retry("send_audio", send_audio)
         finally:
             if thumb_file:
                 thumb_file.close()
@@ -329,15 +778,25 @@ async def publish_entry(
             size = 0
         if size and size <= max_upload_bytes:
             return None
-        logging.info("Transcoding audio to %dkbps.", transcode_bitrate_kbps)
-        return transcode_audio(path, transcode_bitrate_kbps)
+        duration_seconds = get_audio_duration_seconds(path)
+        bitrate_kbps = choose_transcode_bitrate_kbps(
+            duration_seconds,
+            max_upload_bytes,
+        )
+        logging.info("Transcoding audio to %dkbps.", bitrate_kbps)
+        output_path = transcode_audio(path, bitrate_kbps)
+        try:
+            output_size = os.path.getsize(output_path)
+        except OSError:
+            output_size = 0
+        if output_size and output_size > max_upload_bytes:
+            raise AudioTooLargeError(
+                f"Transcoded file too large: {output_size} bytes"
+            )
+        return output_path
 
-    try:
-        await send_audio_with(audio_url)
-    except BadRequest as exc:
-        if not should_fallback_to_download(exc):
-            raise
-        logging.info("Falling back to upload audio file from URL.")
+    async def upload_from_url() -> None:
+        logging.info("Uploading audio file from URL.")
         try:
             audio_path = await asyncio.to_thread(
                 download_to_temp,
@@ -347,9 +806,11 @@ async def publish_entry(
             )
         except AudioTooLargeError as too_large:
             logging.warning("Audio too large to upload: %s", too_large)
-            await bot.send_message(
+            await call_with_retry(
+                "send_message",
+                bot.send_message,
                 chat_id=channel,
-                text=build_fallback_message(text, audio_url),
+                text=build_fallback_message(text, audio_url, language),
             )
         else:
             transcoded_path = None
@@ -361,39 +822,29 @@ async def publish_entry(
                     )
                 except Exception as exc:
                     logging.warning("Transcode failed: %s", exc)
-                    await bot.send_message(
+                    await call_with_retry(
+                        "send_message",
+                        bot.send_message,
                         chat_id=channel,
-                        text=build_fallback_message(text, audio_url),
+                        text=build_fallback_message(text, audio_url, language),
                     )
                     return
+                caption = base_caption
+                if transcoded_path and send_original_link:
+                    caption = append_original_link(base_caption, audio_url, language)
                 path_to_send = transcoded_path or audio_path
                 with open(path_to_send, "rb") as audio_file:
-                    await send_audio_with(audio_file)
+                    await send_audio_with(audio_file, caption)
             except NetworkError as net_exc:
                 if "Request Entity Too Large" not in str(net_exc):
                     raise
-                if transcode_enabled and not transcoded_path:
-                    logging.info("Retrying after transcode due to size limit.")
-                    try:
-                        transcoded_path = await asyncio.to_thread(
-                            transcode_audio,
-                            audio_path,
-                            transcode_bitrate_kbps,
-                        )
-                        with open(transcoded_path, "rb") as audio_file:
-                            await send_audio_with(audio_file)
-                    except Exception as exc:
-                        logging.warning("Transcode retry failed: %s", exc)
-                        await bot.send_message(
-                            chat_id=channel,
-                            text=build_fallback_message(text, audio_url),
-                        )
-                else:
-                    logging.warning("Telegram upload limit exceeded.")
-                    await bot.send_message(
-                        chat_id=channel,
-                        text=build_fallback_message(text, audio_url),
-                    )
+                logging.warning("Telegram upload limit exceeded.")
+                await call_with_retry(
+                    "send_message",
+                    bot.send_message,
+                    chat_id=channel,
+                    text=build_fallback_message(text, audio_url, language),
+                )
             finally:
                 if transcoded_path:
                     try:
@@ -407,6 +858,18 @@ async def publish_entry(
                     os.remove(audio_path)
                 except OSError:
                     logging.warning("Failed to remove temp audio file: %s", audio_path)
+
+    if audio_send_mode == "upload":
+        await upload_from_url()
+        return
+
+    try:
+        await send_audio_with(audio_url, base_caption)
+    except BadRequest as exc:
+        if audio_send_mode == "url" or not should_fallback_to_download(exc):
+            raise
+        logging.info("Falling back to upload audio file from URL.")
+        await upload_from_url()
     finally:
         if thumb_path:
             try:
@@ -415,12 +878,21 @@ async def publish_entry(
                 logging.warning("Failed to remove temp thumbnail: %s", thumb_path)
 
 
-async def publish_new_entries(bot, config: Dict[str, Any], config_path: str) -> int:
+async def publish_new_entries(
+    bot,
+    config: Dict[str, Any],
+    config_path: str,
+    process_all: bool = False,
+) -> int:
     rss_url = config["rss_url"]
+    language = get_language(config)
     max_upload_bytes = get_max_upload_bytes(config)
     max_source_bytes = get_max_source_bytes(config)
+    max_thumb_source_bytes = get_max_thumb_source_bytes(config)
     transcode_enabled = parse_bool(config.get("transcode_enabled"), False)
-    transcode_bitrate_kbps = get_transcode_bitrate_kbps(config)
+    send_original_link = get_send_original_link(config)
+    audio_send_mode = get_audio_send_mode(config)
+    delay_seconds = get_process_all_delay_seconds(config) if process_all else 0
     parsed = feedparser.parse(rss_url)
     if parsed.bozo:
         if parsed.entries:
@@ -436,33 +908,56 @@ async def publish_new_entries(bot, config: Dict[str, Any], config_path: str) -> 
         return 0
 
     last_id = (config.get("last_published_id") or "").strip()
+    process_all_last_id = (config.get("process_all_last_id") or "").strip()
     found_last = False
     new_entries: List[Dict[str, Any]] = []
 
-    for entry in entries:
-        entry_id = get_entry_id(entry)
-        if last_id and entry_id == last_id:
-            found_last = True
-            break
-        new_entries.append(entry)
+    if process_all:
+        ordered = list(reversed(entries))
+        if process_all_last_id:
+            resumed = False
+            for entry in ordered:
+                entry_id = get_entry_id(entry)
+                if not resumed:
+                    if entry_id == process_all_last_id:
+                        resumed = True
+                    continue
+                new_entries.append(entry)
+            if not resumed:
+                logging.warning(
+                    "process_all_last_id not found; starting from oldest."
+                )
+                new_entries = ordered
+        else:
+            new_entries = ordered
+    else:
+        for entry in entries:
+            entry_id = get_entry_id(entry)
+            if last_id and entry_id == last_id:
+                found_last = True
+                break
+            new_entries.append(entry)
 
-    if last_id and not found_last:
-        logging.warning("Last published id not found; posting only the latest entry.")
-        new_entries = entries[:1]
-    elif not last_id:
-        new_entries = entries[:1]
+        if last_id and not found_last:
+            logging.warning(
+                "Last published id not found; posting only the latest entry."
+            )
+            new_entries = entries[:1]
+        elif not last_id:
+            new_entries = entries[:1]
 
     if not new_entries:
         return 0
 
     max_items = int(config.get("max_items_per_run", 0) or 0)
-    if max_items > 0 and len(new_entries) > max_items:
+    if not process_all and max_items > 0 and len(new_entries) > max_items:
         new_entries = new_entries[:max_items]
 
-    new_entries = list(reversed(new_entries))
+    if not process_all:
+        new_entries = list(reversed(new_entries))
 
     last_posted_id = None
-    for entry in new_entries:
+    for index, entry in enumerate(new_entries):
         await publish_entry(
             bot,
             config["channel"],
@@ -471,13 +966,26 @@ async def publish_new_entries(bot, config: Dict[str, Any], config_path: str) -> 
             max_upload_bytes,
             max_source_bytes,
             transcode_enabled,
-            transcode_bitrate_kbps,
+            send_original_link,
+            audio_send_mode,
+            max_thumb_source_bytes,
+            language,
         )
         last_posted_id = get_entry_id(entry)
+        if process_all:
+            config["last_published_id"] = last_posted_id
+            config["process_all_last_id"] = last_posted_id
+            save_config(config_path, config)
+        if process_all and delay_seconds > 0 and index < len(new_entries) - 1:
+            logging.info("Sleeping %s seconds before next entry.", delay_seconds)
+            await asyncio.sleep(delay_seconds)
 
     if last_posted_id:
         config["last_published_id"] = last_posted_id
-        save_config(config_path, config)
+        if process_all:
+            config["process_all_last_id"] = last_posted_id
+        if not process_all:
+            save_config(config_path, config)
 
     return len(new_entries)
 
@@ -489,11 +997,17 @@ async def safe_reply(update: Update, text: str) -> None:
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config_path = context.bot_data["config_path"]
+    try:
+        config = load_config(config_path)
+    except Exception:
+        config = {"language": DEFAULT_LANGUAGE}
+    language = get_language(config)
     user = update.effective_user
     if not user:
-        await safe_reply(update, "Не удалось получить ваш ID.")
+        await safe_reply(update, t(language, "id_not_found"))
         return
-    await safe_reply(update, f"Ваш ID: {user.id}")
+    await safe_reply(update, t(language, "myid_reply", user_id=user.id))
 
 
 async def new_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -502,34 +1016,312 @@ async def new_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         config = load_config(config_path)
     except Exception as exc:
         logging.exception("Failed to load config")
-        await safe_reply(update, f"Ошибка чтения конфига: {exc}")
+        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
         return
 
+    language = get_language(config)
     if not config.get("channel"):
-        await safe_reply(update, "В конфиге не указан channel.")
+        await safe_reply(update, t(language, "config_missing_channel"))
         return
     if not config.get("rss_url"):
-        await safe_reply(update, "В конфиге не указан rss_url.")
+        await safe_reply(update, t(language, "config_missing_rss_url"))
         return
 
     user_id = update.effective_user.id if update.effective_user else None
     if user_id not in config.get("admin_ids", []):
-        await safe_reply(update, "Нет доступа.")
+        await safe_reply(update, t(language, "no_access"))
         return
 
-    await safe_reply(update, "Ищу новые выпуски...")
+    await safe_reply(update, t(language, "searching_new"))
     try:
         count = await publish_new_entries(
             context.bot,
             config,
             config_path,
+            process_all=False,
         )
     except Exception as exc:
         logging.exception("Failed to publish new entries")
-        await safe_reply(update, f"Ошибка: {exc}")
+        await safe_reply(update, t(language, "error_generic", error=exc))
         return
 
-    await safe_reply(update, f"Готово. Опубликовано: {count}")
+    await safe_reply(update, t(language, "done_published", count=count))
+
+
+async def process_all_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config_path = context.bot_data["config_path"]
+    try:
+        config = load_config(config_path)
+    except Exception as exc:
+        logging.exception("Failed to load config")
+        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
+        return
+
+    language = get_language(config)
+    if not config.get("channel"):
+        await safe_reply(update, t(language, "config_missing_channel"))
+        return
+    if not config.get("rss_url"):
+        await safe_reply(update, t(language, "config_missing_rss_url"))
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in config.get("admin_ids", []):
+        await safe_reply(update, t(language, "no_access"))
+        return
+
+    await safe_reply(update, t(language, "processing_all"))
+    try:
+        count = await publish_new_entries(
+            context.bot,
+            config,
+            config_path,
+            process_all=True,
+        )
+    except Exception as exc:
+        logging.exception("Failed to publish all entries")
+        await safe_reply(update, t(language, "error_generic", error=exc))
+        return
+
+    await safe_reply(update, t(language, "done_published", count=count))
+
+
+async def reset_process_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config_path = context.bot_data["config_path"]
+    try:
+        config = load_config(config_path)
+    except Exception as exc:
+        logging.exception("Failed to load config")
+        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
+        return
+
+    language = get_language(config)
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in config.get("admin_ids", []):
+        await safe_reply(update, t(language, "no_access"))
+        return
+
+    config["process_all_last_id"] = ""
+    save_config(config_path, config)
+    await safe_reply(update, t(language, "process_all_reset"))
+
+
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config_path = context.bot_data["config_path"]
+    try:
+        config = load_config(config_path)
+    except Exception as exc:
+        logging.exception("Failed to load config")
+        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
+        return
+
+    language = get_language(config)
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in config.get("admin_ids", []):
+        await safe_reply(update, t(language, "no_access"))
+        return
+
+    if not context.args:
+        await safe_reply(update, t(language, "usage_add_admin"))
+        return
+
+    try:
+        new_admin_id = int(context.args[0])
+    except ValueError:
+        await safe_reply(update, t(language, "invalid_user_id"))
+        return
+
+    admin_ids = config.get("admin_ids", [])
+    if new_admin_id in admin_ids:
+        await safe_reply(update, t(language, "admin_already"))
+        return
+
+    admin_ids.append(new_admin_id)
+    config["admin_ids"] = admin_ids
+    save_config(config_path, config)
+    await safe_reply(update, t(language, "admin_added", user_id=new_admin_id))
+
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config_path = context.bot_data["config_path"]
+    try:
+        config = load_config(config_path)
+    except Exception as exc:
+        logging.exception("Failed to load config")
+        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
+        return
+
+    language = get_language(config)
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in config.get("admin_ids", []):
+        await safe_reply(update, t(language, "no_access"))
+        return
+
+    if not context.args:
+        await safe_reply(update, t(language, "usage_remove_admin"))
+        return
+
+    try:
+        remove_id = int(context.args[0])
+    except ValueError:
+        await safe_reply(update, t(language, "invalid_user_id"))
+        return
+
+    admin_ids = config.get("admin_ids", [])
+    if remove_id not in admin_ids:
+        await safe_reply(update, t(language, "admin_missing"))
+        return
+
+    if len(admin_ids) <= 1:
+        await safe_reply(update, t(language, "admin_remove_last"))
+        return
+
+    admin_ids = [admin_id for admin_id in admin_ids if admin_id != remove_id]
+    config["admin_ids"] = admin_ids
+    save_config(config_path, config)
+    await safe_reply(update, t(language, "admin_removed", user_id=remove_id))
+
+
+async def update_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config_path = context.bot_data["config_path"]
+    try:
+        config = load_config(config_path)
+    except Exception as exc:
+        logging.exception("Failed to load config")
+        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
+        return
+
+    language = get_language(config)
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in config.get("admin_ids", []):
+        await safe_reply(update, t(language, "no_access"))
+        return
+
+    raw = " ".join(context.args).strip()
+    if ":" not in raw:
+        await safe_reply(update, t(language, "usage_update_config"))
+        return
+
+    key, value_raw = raw.split(":", 1)
+    key = key.strip()
+    if not key:
+        await safe_reply(update, t(language, "config_key_missing"))
+        return
+
+    value = parse_config_value(value_raw)
+    if key == "admin_ids":
+        if not isinstance(value, list):
+            await safe_reply(update, t(language, "admin_ids_list_required"))
+            return
+        value = normalize_admin_ids(value)
+
+    config[key] = value
+    save_config(config_path, config)
+
+    if key == "bot_token":
+        await safe_reply(update, t(language, "bot_token_updated"))
+    else:
+        await safe_reply(update, t(language, "config_updated", key=key))
+
+
+async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config_path = context.bot_data["config_path"]
+    try:
+        config = load_config(config_path)
+    except Exception as exc:
+        logging.exception("Failed to load config")
+        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
+        return
+
+    language = get_language(config)
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in config.get("admin_ids", []):
+        await safe_reply(update, t(language, "no_access"))
+        return
+
+    if not context.args:
+        await safe_reply(update, t(language, "usage_set_language"))
+        return
+
+    new_language = context.args[0].strip().lower()
+    if new_language not in SUPPORTED_LANGUAGES:
+        await safe_reply(update, t(language, "language_unsupported", language=new_language))
+        return
+
+    config["language"] = new_language
+    save_config(config_path, config)
+    await safe_reply(update, t(new_language, "language_set", language=new_language))
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config_path = context.bot_data["config_path"]
+    try:
+        config = load_config(config_path)
+    except Exception:
+        config = {"admin_ids": []}
+
+    user_id = update.effective_user.id if update.effective_user else None
+    is_admin = user_id in config.get("admin_ids", [])
+
+    language = get_language(config)
+    lines = [t(language, "help_title"), t(language, "help_myid"), t(language, "help_help")]
+    if is_admin:
+        lines = [
+            t(language, "help_title"),
+            t(language, "help_myid"),
+            t(language, "help_new"),
+            t(language, "help_all"),
+            t(language, "help_reset"),
+            t(language, "help_add_admin"),
+            t(language, "help_remove_admin"),
+            t(language, "help_update"),
+            t(language, "help_set_language"),
+            t(language, "help_help"),
+        ]
+
+    await safe_reply(update, "\n".join(lines))
+
+
+async def auto_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    config_path = context.job.data["config_path"]
+    try:
+        config = load_config(config_path)
+    except Exception as exc:
+        logging.exception("Failed to load config for auto-check")
+        return
+
+    if not get_auto_check_enabled(config):
+        return
+
+    interval = get_auto_check_interval_seconds(config)
+    current_interval = context.job.data.get("interval")
+    if interval != current_interval and interval > 0:
+        logging.info("Rescheduling auto-check to %s seconds.", interval)
+        context.application.job_queue.run_repeating(
+            auto_check_job,
+            interval=interval,
+            first=interval,
+            data={"config_path": config_path, "interval": interval},
+            name="auto_check",
+        )
+        context.job.schedule_removal()
+        return
+
+    if not config.get("channel") or not config.get("rss_url"):
+        logging.warning("Auto-check skipped: channel or rss_url not set.")
+        return
+
+    try:
+        count = await publish_new_entries(
+            context.bot,
+            config,
+            config_path,
+            process_all=False,
+        )
+        if count:
+            logging.info("Auto-check published %s new entries.", count)
+    except Exception:
+        logging.exception("Auto-check failed")
 
 
 def main() -> None:
@@ -549,11 +1341,35 @@ def main() -> None:
     if not config.get("rss_url"):
         raise RuntimeError("rss_url is required in config")
 
-    application = ApplicationBuilder().token(token).build()
+    request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=300,
+        write_timeout=300,
+        pool_timeout=30,
+    )
+    application = ApplicationBuilder().token(token).request(request).build()
     application.bot_data["config_path"] = config_path
 
     application.add_handler(CommandHandler("myid", myid))
     application.add_handler(CommandHandler("new_podcast", new_podcast))
+    application.add_handler(CommandHandler("process_all_podcast", process_all_podcast))
+    application.add_handler(CommandHandler("reset_process_all", reset_process_all))
+    application.add_handler(CommandHandler("add_admin", add_admin))
+    application.add_handler(CommandHandler("remove_admin", remove_admin))
+    application.add_handler(CommandHandler("update_config", update_config))
+    application.add_handler(CommandHandler("set_language", set_language))
+    application.add_handler(CommandHandler("help", help_command))
+
+    if get_auto_check_enabled(config):
+        interval = get_auto_check_interval_seconds(config)
+        application.job_queue.run_repeating(
+            auto_check_job,
+            interval=interval,
+            first=interval,
+            data={"config_path": config_path, "interval": interval},
+            name="auto_check",
+        )
+        logging.info("Auto-check enabled: every %s seconds.", interval)
 
     application.run_polling()
 

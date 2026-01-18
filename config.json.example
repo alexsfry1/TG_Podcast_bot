@@ -2,8 +2,18 @@
   "bot_token": "123456:ABCdefGhIJKlmnoPQRstuvWXYz9876543210",
   "channel": "@example_channel",
   "admin_ids": [111111111, 222222222],
+  "language": "ru",
+  "auto_check_enabled": true,
+  "auto_check_interval_seconds": 86400,
   "rss_url": "https://feeds.redcircle.com/7c61c61e-e8c1-4db4-9e74-14c3839fa83a",
   "last_published_id": "example-id-001",
+  "process_all_last_id": "",
   "max_items_per_run": 5,
-  "max_upload_mb": 45
+  "max_upload_mb": 45,
+  "max_source_mb": 200,
+  "max_thumb_source_mb": 15,
+  "transcode_enabled": false,
+  "send_original_link": true,
+  "process_all_delay_seconds": 120,
+  "audio_send_mode": "auto"
 }
