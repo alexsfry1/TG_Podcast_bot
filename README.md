@@ -40,6 +40,9 @@ source .venv/bin/activate.fish
 pip install -r requirements.txt
 ```
 
+Note: The bot uses PTB JobQueue for automatic checks. If you install packages manually,
+make sure `python-telegram-bot[job-queue]` is included.
+
 ## Run
 
 ```
