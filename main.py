@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import time
 from html import unescape
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import feedparser
 import requests
@@ -53,6 +53,8 @@ MESSAGES = {
         "no_access": "Нет доступа.",
         "searching_new": "Ищу новые выпуски...",
         "processing_all": "Запускаю обработку всех выпусков...",
+        "uploading_audio": "Загружаю аудиофайл по ссылке...",
+        "transcoding_audio": "Перекодирую аудио в {bitrate_kbps} кбит/с...",
         "done_published": "Готово. Опубликовано: {count}",
         "error_generic": "Ошибка: {error}",
         "process_all_reset": "Сбросил process_all_last_id.",
@@ -97,6 +99,8 @@ MESSAGES = {
         "no_access": "Access denied.",
         "searching_new": "Looking for new episodes...",
         "processing_all": "Processing all episodes...",
+        "uploading_audio": "Uploading audio file from URL...",
+        "transcoding_audio": "Transcoding audio to {bitrate_kbps} kbps...",
         "done_published": "Done. Published: {count}",
         "error_generic": "Error: {error}",
         "process_all_reset": "process_all_last_id reset.",
@@ -139,6 +143,7 @@ FALLBACK_AUDIO_ERRORS = (
     "wrong type of the web page content",
     "wrong file identifier/http url specified",
     "webpage_media_empty",
+    "request entity too large",
 )
 
 
@@ -697,6 +702,7 @@ async def publish_entry(
     audio_send_mode: str,
     max_thumb_source_bytes: int,
     language: str,
+    status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> None:
     title = (entry.get("title") or "").strip()
     performer = (feed.get("title") or "").strip() or None
@@ -718,6 +724,14 @@ async def publish_entry(
         except Exception as exc:
             logging.warning("Failed to prepare thumbnail: %s", exc)
 
+    async def report_status(key: str, **kwargs: Any) -> None:
+        if not status_callback:
+            return
+        try:
+            await status_callback(t(language, key, **kwargs))
+        except Exception as exc:
+            logging.warning("Failed to send status message: %s", exc)
+
     async def send_audio_with(source, caption_text: str) -> None:
         thumb_file = None
         size_bytes = get_source_size_bytes(source)
@@ -727,6 +741,8 @@ async def publish_entry(
             async def send_audio() -> None:
                 if hasattr(source, "seek"):
                     source.seek(0)
+                if thumb_file and hasattr(thumb_file, "seek"):
+                    thumb_file.seek(0)
                 start = time.monotonic()
                 try:
                     await bot.send_audio(
@@ -769,7 +785,7 @@ async def publish_entry(
             if thumb_file:
                 thumb_file.close()
 
-    def maybe_transcode(path: str) -> Optional[str]:
+    async def maybe_transcode(path: str) -> Optional[str]:
         if not transcode_enabled:
             return None
         try:
@@ -778,13 +794,14 @@ async def publish_entry(
             size = 0
         if size and size <= max_upload_bytes:
             return None
-        duration_seconds = get_audio_duration_seconds(path)
+        duration_seconds = await asyncio.to_thread(get_audio_duration_seconds, path)
         bitrate_kbps = choose_transcode_bitrate_kbps(
             duration_seconds,
             max_upload_bytes,
         )
         logging.info("Transcoding audio to %dkbps.", bitrate_kbps)
-        output_path = transcode_audio(path, bitrate_kbps)
+        await report_status("transcoding_audio", bitrate_kbps=bitrate_kbps)
+        output_path = await asyncio.to_thread(transcode_audio, path, bitrate_kbps)
         try:
             output_size = os.path.getsize(output_path)
         except OSError:
@@ -797,6 +814,7 @@ async def publish_entry(
 
     async def upload_from_url() -> None:
         logging.info("Uploading audio file from URL.")
+        await report_status("uploading_audio")
         try:
             audio_path = await asyncio.to_thread(
                 download_to_temp,
@@ -816,10 +834,7 @@ async def publish_entry(
             transcoded_path = None
             try:
                 try:
-                    transcoded_path = await asyncio.to_thread(
-                        maybe_transcode,
-                        audio_path,
-                    )
+                    transcoded_path = await maybe_transcode(audio_path)
                 except Exception as exc:
                     logging.warning("Transcode failed: %s", exc)
                     await call_with_retry(
@@ -866,7 +881,11 @@ async def publish_entry(
     try:
         await send_audio_with(audio_url, base_caption)
     except BadRequest as exc:
-        if audio_send_mode == "url" or not should_fallback_to_download(exc):
+        error_message = str(exc).lower()
+        too_large = "request entity too large" in error_message
+        if audio_send_mode == "url" and not too_large:
+            raise
+        if not too_large and not should_fallback_to_download(exc):
             raise
         logging.info("Falling back to upload audio file from URL.")
         await upload_from_url()
@@ -883,6 +902,7 @@ async def publish_new_entries(
     config: Dict[str, Any],
     config_path: str,
     process_all: bool = False,
+    status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> int:
     rss_url = config["rss_url"]
     language = get_language(config)
@@ -893,7 +913,7 @@ async def publish_new_entries(
     send_original_link = get_send_original_link(config)
     audio_send_mode = get_audio_send_mode(config)
     delay_seconds = get_process_all_delay_seconds(config) if process_all else 0
-    parsed = feedparser.parse(rss_url)
+    parsed = await asyncio.to_thread(feedparser.parse, rss_url)
     if parsed.bozo:
         if parsed.entries:
             logging.warning(
@@ -949,7 +969,7 @@ async def publish_new_entries(
     if not new_entries:
         return 0
 
-    max_items = int(config.get("max_items_per_run", 0) or 0)
+    max_items = parse_non_negative_int(config.get("max_items_per_run"), 0)
     if not process_all and max_items > 0 and len(new_entries) > max_items:
         new_entries = new_entries[:max_items]
 
@@ -970,6 +990,7 @@ async def publish_new_entries(
             audio_send_mode,
             max_thumb_source_bytes,
             language,
+            status_callback,
         )
         last_posted_id = get_entry_id(entry)
         if process_all:
@@ -1039,6 +1060,7 @@ async def new_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             config,
             config_path,
             process_all=False,
+            status_callback=lambda text: safe_reply(update, text),
         )
     except Exception as exc:
         logging.exception("Failed to publish new entries")
@@ -1077,6 +1099,7 @@ async def process_all_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE
             config,
             config_path,
             process_all=True,
+            status_callback=lambda text: safe_reply(update, text),
         )
     except Exception as exc:
         logging.exception("Failed to publish all entries")
@@ -1214,6 +1237,9 @@ async def update_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await safe_reply(update, t(language, "admin_ids_list_required"))
             return
         value = normalize_admin_ids(value)
+        if not value:
+            await safe_reply(update, t(language, "admin_remove_last"))
+            return
 
     config[key] = value
     save_config(config_path, config)
