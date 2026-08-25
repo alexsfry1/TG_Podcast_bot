@@ -1,12 +1,13 @@
 # TG Podcast Bot
 
-Telegram bot that publishes podcast episodes from an RSS feed into a channel. The bot posts a single message per episode: audio + caption + cover image (thumbnail).
+Telegram bot that publishes podcast episodes from an RSS feed into a channel. For each episode, the bot posts a full-size cover with the caption, followed by the audio with the same cover as its player thumbnail.
 
 ## What the bot does
 
 - Fetches RSS by URL.
 - Extracts title, description, cover image, and MP3 enclosure.
-- Sends a single Telegram message with audio + caption + cover.
+- Sends a full-size cover with the episode caption, followed by the audio.
+- Keeps the cover as the audio player's thumbnail as well.
 - Tracks `last_published_id` in `config.json` to avoid duplicates.
 - Supports a full backfill mode (`/process_all_podcast`) with a configurable delay between posts.
 - If MP3 is too big for Telegram, it can transcode to fit the limit (optional).
@@ -59,7 +60,7 @@ CONFIG_PATH=/path/to/config.json python main.py
 
 - `/myid` — returns your Telegram user ID.
 - `/new_podcast` — publishes new episodes since `last_published_id`.
-- `/process_all_podcast` — publishes all episodes from the RSS (oldest → newest) with delay between posts.
+- `/process_all_podcast` — starts background publishing of all episodes (oldest → newest) with delay between posts.
 - `/reset_process_all` — clears `process_all_last_id` so `/process_all_podcast` starts from the beginning.
 - `/add_admin <user_id>` — adds a user ID to admin list (admin-only).
 - `/remove_admin <user_id>` — removes a user ID from admin list (admin-only).
@@ -94,11 +95,20 @@ Optional:
 
 ## How posting works
 
-1. Bot reads RSS and extracts audio URL and description.
-2. It tries to send audio by URL directly.
-3. If Telegram cannot fetch the URL, it downloads and uploads the file.
-4. If the file is too large and `transcode_enabled=true`, it transcodes to fit.
-5. If still too large, the bot posts a text fallback with a link.
+1. Bot reads RSS and extracts the audio URL, description, and cover.
+2. It posts the full-size cover with the episode caption. If this fails, the caption stays on the audio message.
+3. It tries to send audio by URL directly and uses the cover as the player thumbnail.
+4. If Telegram cannot fetch the URL, it downloads and uploads the file.
+5. If the file is too large and `transcode_enabled=true`, it transcodes to fit.
+6. If still too large, the bot posts a fallback with a link.
+
+Publication runs are serialized, so the automatic check and manual publishing commands cannot publish the same batch concurrently. Progress is saved after every successfully published episode.
+
+## Tests
+
+```
+.venv/bin/python -m unittest discover -v
+```
 
 ## Troubleshooting
 
@@ -106,7 +116,7 @@ Optional:
 - `JSONDecodeError`: check commas in `config.json`.
 - `Failed to get http url content`: fallback download is used automatically.
 - `Request Entity Too Large (413)`: enable transcoding or reduce bitrate.
-- `Timed out`: large upload, retry or increase delays.
+- `Timed out`: check the channel before running the command again; Telegram may have accepted the message even if the response timed out.
 
 ## Notes
 

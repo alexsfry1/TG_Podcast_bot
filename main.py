@@ -18,6 +18,8 @@ from telegram.request import HTTPXRequest
 
 CONFIG_PATH_ENV = "CONFIG_PATH"
 DEFAULT_CONFIG_PATH = "config.json"
+PUBLISH_LOCK_KEY = "publish_lock"
+CONFIG_LOCK_KEY = "config_lock"
 
 TAG_RE = re.compile(r"<[^>]+>")
 DEFAULT_MAX_UPLOAD_BYTES = 45 * 1024 * 1024
@@ -31,8 +33,6 @@ THUMB_MAX_BYTES = 200 * 1024
 THUMB_MAX_DIM = 320
 THUMB_QUALITIES = (6, 10, 14, 18, 22, 26, 30)
 THUMB_SIZES = (THUMB_MAX_DIM, 256, 192, 128)
-DEFAULT_SEND_RETRIES = 5
-DEFAULT_SEND_RETRY_BASE_SECONDS = 3
 DEFAULT_PROCESS_ALL_DELAY_SECONDS = 120
 DEFAULT_AUDIO_SEND_MODE = "auto"
 DEFAULT_DOWNLOAD_RETRIES = 3
@@ -53,6 +53,7 @@ MESSAGES = {
         "no_access": "Нет доступа.",
         "searching_new": "Ищу новые выпуски...",
         "processing_all": "Запускаю обработку всех выпусков...",
+        "publishing_in_progress": "Публикация уже выполняется. Дождитесь её завершения.",
         "uploading_audio": "Загружаю аудиофайл по ссылке...",
         "transcoding_audio": "Перекодирую аудио в {bitrate_kbps} кбит/с...",
         "done_published": "Готово. Опубликовано: {count}",
@@ -99,6 +100,7 @@ MESSAGES = {
         "no_access": "Access denied.",
         "searching_new": "Looking for new episodes...",
         "processing_all": "Processing all episodes...",
+        "publishing_in_progress": "Publishing is already in progress. Wait for it to finish.",
         "uploading_audio": "Uploading audio file from URL...",
         "transcoding_audio": "Transcoding audio to {bitrate_kbps} kbps...",
         "done_published": "Done. Published: {count}",
@@ -169,9 +171,26 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 def save_config(path: str, data: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-        f.write("\n")
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temp_path = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=directory)
+    try:
+        os.chmod(temp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
@@ -371,7 +390,7 @@ def download_to_temp(url: str, suffix: str, max_bytes: int) -> str:
                                 )
                             tmp.write(chunk)
                         return tmp.name
-                    except (AudioTooLargeError, requests.RequestException):
+                    except (AudioTooLargeError, requests.RequestException, OSError):
                         tmp.close()
                         try:
                             os.remove(tmp.name)
@@ -415,8 +434,16 @@ def transcode_audio(input_path: str, bitrate_kbps: int) -> str:
     try:
         subprocess.run(command, check=True)
     except FileNotFoundError as exc:
+        try:
+            os.remove(output.name)
+        except OSError:
+            pass
         raise RuntimeError("ffmpeg not found. Install ffmpeg to use transcoding.") from exc
     except subprocess.CalledProcessError as exc:
+        try:
+            os.remove(output.name)
+        except OSError:
+            pass
         raise RuntimeError("ffmpeg failed to transcode audio.") from exc
     return output.name
 
@@ -449,6 +476,10 @@ def create_thumbnail(input_path: str) -> Optional[str]:
             try:
                 subprocess.run(command, check=True)
             except FileNotFoundError as exc:
+                try:
+                    os.remove(output.name)
+                except OSError:
+                    pass
                 raise RuntimeError(
                     "ffmpeg not found. Install ffmpeg to use thumbnails."
                 ) from exc
@@ -566,23 +597,34 @@ def format_caption(entry: Dict[str, Any], max_length: int = 1024) -> str:
 
 def build_fallback_message(text: str, audio_url: str, language: str) -> str:
     note = t(language, "fallback_too_large", url=audio_url)
+    if len(note) > MAX_MESSAGE_LENGTH:
+        if len(audio_url) <= MAX_MESSAGE_LENGTH:
+            return audio_url
+        return audio_url[:MAX_MESSAGE_LENGTH]
     if not text:
         return note
-    combined = f"{text}\n\n{note}"
-    if len(combined) > MAX_MESSAGE_LENGTH:
-        combined = combined[: MAX_MESSAGE_LENGTH - 3].rstrip() + "..."
-    return combined
+    available = MAX_MESSAGE_LENGTH - len(note) - 2
+    if available <= 3:
+        return note
+    if len(text) > available:
+        text = text[: available - 3].rstrip() + "..."
+    return f"{text}\n\n{note}"
 
 
 def append_original_link(caption: str, audio_url: str, language: str) -> str:
     note = t(language, "original_label", url=audio_url)
+    if len(note) > 1024:
+        if len(audio_url) <= 1024:
+            return audio_url
+        return audio_url[:1024]
     if not caption:
-        combined = note
-    else:
-        combined = f"{caption}\n\n{note}"
-    if len(combined) > 1024:
-        combined = combined[: 1024 - 3].rstrip() + "..."
-    return combined
+        return note
+    available = 1024 - len(note) - 2
+    if available <= 3:
+        return note
+    if len(caption) > available:
+        caption = caption[: available - 3].rstrip() + "..."
+    return f"{caption}\n\n{note}"
 
 
 def get_source_size_bytes(source) -> Optional[int]:
@@ -638,23 +680,26 @@ def normalize_admin_ids(value: Any) -> List[int]:
     return cleaned
 
 
-async def call_with_retry(label: str, call, *args, **kwargs):
-    for attempt in range(1, DEFAULT_SEND_RETRIES + 1):
-        try:
-            return await call(*args, **kwargs)
-        except (TimedOut, NetworkError) as exc:
-            if attempt >= DEFAULT_SEND_RETRIES:
-                raise
-            delay = DEFAULT_SEND_RETRY_BASE_SECONDS ** attempt
-            logging.warning(
-                "%s failed: %s. Retrying in %ss (%d/%d).",
-                label,
-                exc,
-                delay,
-                attempt,
-                DEFAULT_SEND_RETRIES,
-            )
-            await asyncio.sleep(delay)
+def get_context_lock(context: ContextTypes.DEFAULT_TYPE, key: str) -> asyncio.Lock:
+    lock = context.bot_data.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        context.bot_data[key] = lock
+    return lock
+
+
+async def call_telegram_once(label: str, call, *args, **kwargs):
+    try:
+        return await call(*args, **kwargs)
+    except BadRequest:
+        raise
+    except (TimedOut, NetworkError) as exc:
+        logging.warning(
+            "%s failed with an ambiguous network error; not retrying to avoid duplicates: %s",
+            label,
+            exc,
+        )
+        raise
 
 
 def build_thumbnail(image_url: str, max_bytes: int) -> Optional[str]:
@@ -732,7 +777,7 @@ async def publish_entry(
         except Exception as exc:
             logging.warning("Failed to send status message: %s", exc)
 
-    async def send_audio_with(source, caption_text: str) -> None:
+    async def send_audio_with(source, caption_text: Optional[str]) -> None:
         thumb_file = None
         size_bytes = get_source_size_bytes(source)
         try:
@@ -780,10 +825,46 @@ async def publish_entry(
                     else:
                         logging.info("send_audio ok in %.1fs (source=url).", elapsed)
 
-            await call_with_retry("send_audio", send_audio)
+            await call_telegram_once("send_audio", send_audio)
         finally:
             if thumb_file:
                 thumb_file.close()
+
+    async def send_cover_message(caption_text: str) -> Optional[Any]:
+        if not image_url:
+            return None
+
+        try:
+            return await call_telegram_once(
+                "send_photo",
+                bot.send_photo,
+                chat_id=channel,
+                photo=image_url,
+                caption=caption_text or None,
+            )
+        except BadRequest as exc:
+            if not thumb_path:
+                logging.warning("Failed to send cover image: %s", exc)
+                return None
+            logging.warning(
+                "Failed to send cover image by URL: %s. Trying local thumbnail.",
+                exc,
+            )
+
+        try:
+            with open(thumb_path, "rb") as cover_file:
+                async def send_local_cover() -> Any:
+                    cover_file.seek(0)
+                    return await bot.send_photo(
+                        chat_id=channel,
+                        photo=cover_file,
+                        caption=caption_text or None,
+                    )
+
+                return await call_telegram_once("send_photo", send_local_cover)
+        except (BadRequest, OSError) as exc:
+            logging.warning("Failed to send local cover image: %s", exc)
+            return None
 
     async def maybe_transcode(path: str) -> Optional[str]:
         if not transcode_enabled:
@@ -807,10 +888,20 @@ async def publish_entry(
         except OSError:
             output_size = 0
         if output_size and output_size > max_upload_bytes:
+            try:
+                os.remove(output_path)
+            except OSError:
+                logging.warning(
+                    "Failed to remove oversized transcoded file: %s",
+                    output_path,
+                )
             raise AudioTooLargeError(
                 f"Transcoded file too large: {output_size} bytes"
             )
         return output_path
+
+    audio_caption: Optional[str] = base_caption
+    fallback_text = text
 
     async def upload_from_url() -> None:
         logging.info("Uploading audio file from URL.")
@@ -824,11 +915,11 @@ async def publish_entry(
             )
         except AudioTooLargeError as too_large:
             logging.warning("Audio too large to upload: %s", too_large)
-            await call_with_retry(
+            await call_telegram_once(
                 "send_message",
                 bot.send_message,
                 chat_id=channel,
-                text=build_fallback_message(text, audio_url, language),
+                text=build_fallback_message(fallback_text, audio_url, language),
             )
         else:
             transcoded_path = None
@@ -837,16 +928,24 @@ async def publish_entry(
                     transcoded_path = await maybe_transcode(audio_path)
                 except Exception as exc:
                     logging.warning("Transcode failed: %s", exc)
-                    await call_with_retry(
+                    await call_telegram_once(
                         "send_message",
                         bot.send_message,
                         chat_id=channel,
-                        text=build_fallback_message(text, audio_url, language),
+                        text=build_fallback_message(
+                            fallback_text,
+                            audio_url,
+                            language,
+                        ),
                     )
                     return
-                caption = base_caption
+                caption = audio_caption
                 if transcoded_path and send_original_link:
-                    caption = append_original_link(base_caption, audio_url, language)
+                    caption = append_original_link(
+                        audio_caption or "",
+                        audio_url,
+                        language,
+                    )
                 path_to_send = transcoded_path or audio_path
                 with open(path_to_send, "rb") as audio_file:
                     await send_audio_with(audio_file, caption)
@@ -854,11 +953,15 @@ async def publish_entry(
                 if "Request Entity Too Large" not in str(net_exc):
                     raise
                 logging.warning("Telegram upload limit exceeded.")
-                await call_with_retry(
+                await call_telegram_once(
                     "send_message",
                     bot.send_message,
                     chat_id=channel,
-                    text=build_fallback_message(text, audio_url, language),
+                    text=build_fallback_message(
+                        fallback_text,
+                        audio_url,
+                        language,
+                    ),
                 )
             finally:
                 if transcoded_path:
@@ -874,21 +977,50 @@ async def publish_entry(
                 except OSError:
                     logging.warning("Failed to remove temp audio file: %s", audio_path)
 
-    if audio_send_mode == "upload":
-        await upload_from_url()
-        return
-
+    cover_message = None
     try:
-        await send_audio_with(audio_url, base_caption)
-    except BadRequest as exc:
-        error_message = str(exc).lower()
-        too_large = "request entity too large" in error_message
-        if audio_send_mode == "url" and not too_large:
-            raise
-        if not too_large and not should_fallback_to_download(exc):
-            raise
-        logging.info("Falling back to upload audio file from URL.")
-        await upload_from_url()
+        try:
+            cover_message = await send_cover_message(base_caption)
+        except (NetworkError, TimedOut) as exc:
+            logging.warning("Failed to send cover image: %s", exc)
+            cover_message = None
+
+        if cover_message is not None:
+            audio_caption = None
+            fallback_text = ""
+
+        if audio_send_mode == "upload":
+            await upload_from_url()
+            return
+
+        try:
+            await send_audio_with(audio_url, audio_caption)
+        except BadRequest as exc:
+            error_message = str(exc).lower()
+            too_large = "request entity too large" in error_message
+            if audio_send_mode == "url" and not too_large:
+                raise
+            if not too_large and not should_fallback_to_download(exc):
+                raise
+            logging.info("Falling back to upload audio file from URL.")
+            await upload_from_url()
+    except Exception:
+        message_id = getattr(cover_message, "message_id", None)
+        if message_id is not None:
+            try:
+                await call_telegram_once(
+                    "delete_orphaned_cover",
+                    bot.delete_message,
+                    chat_id=channel,
+                    message_id=message_id,
+                )
+            except Exception as cleanup_exc:
+                logging.warning(
+                    "Failed to delete orphaned cover message %s: %s",
+                    message_id,
+                    cleanup_exc,
+                )
+        raise
     finally:
         if thumb_path:
             try:
@@ -903,7 +1035,41 @@ async def publish_new_entries(
     config_path: str,
     process_all: bool = False,
     status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+    publish_lock: Optional[asyncio.Lock] = None,
+    config_lock: Optional[asyncio.Lock] = None,
 ) -> int:
+    if publish_lock is not None:
+        async with publish_lock:
+            return await _publish_new_entries(
+                bot,
+                config,
+                config_path,
+                process_all,
+                status_callback,
+                config_lock,
+            )
+    return await _publish_new_entries(
+        bot,
+        config,
+        config_path,
+        process_all,
+        status_callback,
+        config_lock,
+    )
+
+
+async def _publish_new_entries(
+    bot,
+    config: Dict[str, Any],
+    config_path: str,
+    process_all: bool,
+    status_callback: Optional[Callable[[str], Awaitable[None]]],
+    config_lock: Optional[asyncio.Lock],
+) -> int:
+    if config_lock is not None:
+        async with config_lock:
+            config = load_config(config_path)
+
     rss_url = config["rss_url"]
     language = get_language(config)
     max_upload_bytes = get_max_upload_bytes(config)
@@ -969,14 +1135,29 @@ async def publish_new_entries(
     if not new_entries:
         return 0
 
-    max_items = parse_non_negative_int(config.get("max_items_per_run"), 0)
-    if not process_all and max_items > 0 and len(new_entries) > max_items:
-        new_entries = new_entries[:max_items]
-
     if not process_all:
         new_entries = list(reversed(new_entries))
+        max_items = parse_non_negative_int(config.get("max_items_per_run"), 0)
+        if max_items > 0 and len(new_entries) > max_items:
+            new_entries = new_entries[:max_items]
 
-    last_posted_id = None
+    async def save_progress(entry_id: str) -> None:
+        nonlocal config
+        if config_lock is not None:
+            async with config_lock:
+                latest_config = load_config(config_path)
+                latest_config["last_published_id"] = entry_id
+                if process_all:
+                    latest_config["process_all_last_id"] = entry_id
+                save_config(config_path, latest_config)
+            config = latest_config
+            return
+
+        config["last_published_id"] = entry_id
+        if process_all:
+            config["process_all_last_id"] = entry_id
+        save_config(config_path, config)
+
     for index, entry in enumerate(new_entries):
         await publish_entry(
             bot,
@@ -992,21 +1173,10 @@ async def publish_new_entries(
             language,
             status_callback,
         )
-        last_posted_id = get_entry_id(entry)
-        if process_all:
-            config["last_published_id"] = last_posted_id
-            config["process_all_last_id"] = last_posted_id
-            save_config(config_path, config)
+        await save_progress(get_entry_id(entry))
         if process_all and delay_seconds > 0 and index < len(new_entries) - 1:
             logging.info("Sleeping %s seconds before next entry.", delay_seconds)
             await asyncio.sleep(delay_seconds)
-
-    if last_posted_id:
-        config["last_published_id"] = last_posted_id
-        if process_all:
-            config["process_all_last_id"] = last_posted_id
-        if not process_all:
-            save_config(config_path, config)
 
     return len(new_entries)
 
@@ -1053,6 +1223,12 @@ async def new_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update, t(language, "no_access"))
         return
 
+    publish_lock = get_context_lock(context, PUBLISH_LOCK_KEY)
+    config_lock = get_context_lock(context, CONFIG_LOCK_KEY)
+    if publish_lock.locked():
+        await safe_reply(update, t(language, "publishing_in_progress"))
+        return
+
     await safe_reply(update, t(language, "searching_new"))
     try:
         count = await publish_new_entries(
@@ -1061,6 +1237,8 @@ async def new_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             config_path,
             process_all=False,
             status_callback=lambda text: safe_reply(update, text),
+            publish_lock=publish_lock,
+            config_lock=config_lock,
         )
     except Exception as exc:
         logging.exception("Failed to publish new entries")
@@ -1092,191 +1270,224 @@ async def process_all_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE
         await safe_reply(update, t(language, "no_access"))
         return
 
-    await safe_reply(update, t(language, "processing_all"))
-    try:
-        count = await publish_new_entries(
-            context.bot,
-            config,
-            config_path,
-            process_all=True,
-            status_callback=lambda text: safe_reply(update, text),
-        )
-    except Exception as exc:
-        logging.exception("Failed to publish all entries")
-        await safe_reply(update, t(language, "error_generic", error=exc))
+    publish_lock = get_context_lock(context, PUBLISH_LOCK_KEY)
+    config_lock = get_context_lock(context, CONFIG_LOCK_KEY)
+    if publish_lock.locked():
+        await safe_reply(update, t(language, "publishing_in_progress"))
         return
 
-    await safe_reply(update, t(language, "done_published", count=count))
+    await publish_lock.acquire()
+    try:
+        await safe_reply(update, t(language, "processing_all"))
+    except Exception:
+        publish_lock.release()
+        raise
+
+    async def run_in_background() -> None:
+        try:
+            count = await publish_new_entries(
+                context.bot,
+                config,
+                config_path,
+                process_all=True,
+                status_callback=lambda text: safe_reply(update, text),
+                config_lock=config_lock,
+            )
+        except Exception as exc:
+            logging.exception("Failed to publish all entries")
+            await safe_reply(update, t(language, "error_generic", error=exc))
+        else:
+            await safe_reply(update, t(language, "done_published", count=count))
+        finally:
+            publish_lock.release()
+
+    background_coro = run_in_background()
+    try:
+        context.application.create_task(
+            background_coro,
+            update=update,
+            name="process_all_podcast",
+        )
+    except Exception:
+        background_coro.close()
+        publish_lock.release()
+        raise
 
 
 async def reset_process_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config_path = context.bot_data["config_path"]
+    config_lock = get_context_lock(context, CONFIG_LOCK_KEY)
+    user_id = update.effective_user.id if update.effective_user else None
     try:
-        config = load_config(config_path)
+        async with config_lock:
+            config = load_config(config_path)
+            language = get_language(config)
+            if user_id not in config.get("admin_ids", []):
+                reply_text = t(language, "no_access")
+            else:
+                config["process_all_last_id"] = ""
+                save_config(config_path, config)
+                reply_text = t(language, "process_all_reset")
     except Exception as exc:
         logging.exception("Failed to load config")
-        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
-        return
-
-    language = get_language(config)
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id not in config.get("admin_ids", []):
-        await safe_reply(update, t(language, "no_access"))
-        return
-
-    config["process_all_last_id"] = ""
-    save_config(config_path, config)
-    await safe_reply(update, t(language, "process_all_reset"))
+        reply_text = t(DEFAULT_LANGUAGE, "config_read_error", error=exc)
+    await safe_reply(update, reply_text)
 
 
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config_path = context.bot_data["config_path"]
+    config_lock = get_context_lock(context, CONFIG_LOCK_KEY)
+    user_id = update.effective_user.id if update.effective_user else None
     try:
-        config = load_config(config_path)
+        async with config_lock:
+            config = load_config(config_path)
+            language = get_language(config)
+            if user_id not in config.get("admin_ids", []):
+                reply_text = t(language, "no_access")
+            elif not context.args:
+                reply_text = t(language, "usage_add_admin")
+            else:
+                try:
+                    new_admin_id = int(context.args[0])
+                except ValueError:
+                    reply_text = t(language, "invalid_user_id")
+                else:
+                    admin_ids = config.get("admin_ids", [])
+                    if new_admin_id in admin_ids:
+                        reply_text = t(language, "admin_already")
+                    else:
+                        admin_ids.append(new_admin_id)
+                        config["admin_ids"] = admin_ids
+                        save_config(config_path, config)
+                        reply_text = t(
+                            language,
+                            "admin_added",
+                            user_id=new_admin_id,
+                        )
     except Exception as exc:
         logging.exception("Failed to load config")
-        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
-        return
-
-    language = get_language(config)
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id not in config.get("admin_ids", []):
-        await safe_reply(update, t(language, "no_access"))
-        return
-
-    if not context.args:
-        await safe_reply(update, t(language, "usage_add_admin"))
-        return
-
-    try:
-        new_admin_id = int(context.args[0])
-    except ValueError:
-        await safe_reply(update, t(language, "invalid_user_id"))
-        return
-
-    admin_ids = config.get("admin_ids", [])
-    if new_admin_id in admin_ids:
-        await safe_reply(update, t(language, "admin_already"))
-        return
-
-    admin_ids.append(new_admin_id)
-    config["admin_ids"] = admin_ids
-    save_config(config_path, config)
-    await safe_reply(update, t(language, "admin_added", user_id=new_admin_id))
+        reply_text = t(DEFAULT_LANGUAGE, "config_read_error", error=exc)
+    await safe_reply(update, reply_text)
 
 
 async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config_path = context.bot_data["config_path"]
+    config_lock = get_context_lock(context, CONFIG_LOCK_KEY)
+    user_id = update.effective_user.id if update.effective_user else None
     try:
-        config = load_config(config_path)
+        async with config_lock:
+            config = load_config(config_path)
+            language = get_language(config)
+            if user_id not in config.get("admin_ids", []):
+                reply_text = t(language, "no_access")
+            elif not context.args:
+                reply_text = t(language, "usage_remove_admin")
+            else:
+                try:
+                    remove_id = int(context.args[0])
+                except ValueError:
+                    reply_text = t(language, "invalid_user_id")
+                else:
+                    admin_ids = config.get("admin_ids", [])
+                    if remove_id not in admin_ids:
+                        reply_text = t(language, "admin_missing")
+                    elif len(admin_ids) <= 1:
+                        reply_text = t(language, "admin_remove_last")
+                    else:
+                        config["admin_ids"] = [
+                            admin_id
+                            for admin_id in admin_ids
+                            if admin_id != remove_id
+                        ]
+                        save_config(config_path, config)
+                        reply_text = t(
+                            language,
+                            "admin_removed",
+                            user_id=remove_id,
+                        )
     except Exception as exc:
         logging.exception("Failed to load config")
-        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
-        return
-
-    language = get_language(config)
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id not in config.get("admin_ids", []):
-        await safe_reply(update, t(language, "no_access"))
-        return
-
-    if not context.args:
-        await safe_reply(update, t(language, "usage_remove_admin"))
-        return
-
-    try:
-        remove_id = int(context.args[0])
-    except ValueError:
-        await safe_reply(update, t(language, "invalid_user_id"))
-        return
-
-    admin_ids = config.get("admin_ids", [])
-    if remove_id not in admin_ids:
-        await safe_reply(update, t(language, "admin_missing"))
-        return
-
-    if len(admin_ids) <= 1:
-        await safe_reply(update, t(language, "admin_remove_last"))
-        return
-
-    admin_ids = [admin_id for admin_id in admin_ids if admin_id != remove_id]
-    config["admin_ids"] = admin_ids
-    save_config(config_path, config)
-    await safe_reply(update, t(language, "admin_removed", user_id=remove_id))
+        reply_text = t(DEFAULT_LANGUAGE, "config_read_error", error=exc)
+    await safe_reply(update, reply_text)
 
 
 async def update_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config_path = context.bot_data["config_path"]
+    config_lock = get_context_lock(context, CONFIG_LOCK_KEY)
+    user_id = update.effective_user.id if update.effective_user else None
     try:
-        config = load_config(config_path)
+        async with config_lock:
+            config = load_config(config_path)
+            language = get_language(config)
+            if user_id not in config.get("admin_ids", []):
+                reply_text = t(language, "no_access")
+            else:
+                raw = " ".join(context.args).strip()
+                if ":" not in raw:
+                    reply_text = t(language, "usage_update_config")
+                else:
+                    key, value_raw = raw.split(":", 1)
+                    key = key.strip()
+                    if not key:
+                        reply_text = t(language, "config_key_missing")
+                    else:
+                        value = parse_config_value(value_raw)
+                        if key == "admin_ids" and not isinstance(value, list):
+                            reply_text = t(language, "admin_ids_list_required")
+                        else:
+                            if key == "admin_ids":
+                                value = normalize_admin_ids(value)
+                            if key == "admin_ids" and not value:
+                                reply_text = t(language, "admin_remove_last")
+                            else:
+                                config[key] = value
+                                save_config(config_path, config)
+                                if key == "bot_token":
+                                    reply_text = t(language, "bot_token_updated")
+                                else:
+                                    reply_text = t(
+                                        language,
+                                        "config_updated",
+                                        key=key,
+                                    )
     except Exception as exc:
         logging.exception("Failed to load config")
-        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
-        return
-
-    language = get_language(config)
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id not in config.get("admin_ids", []):
-        await safe_reply(update, t(language, "no_access"))
-        return
-
-    raw = " ".join(context.args).strip()
-    if ":" not in raw:
-        await safe_reply(update, t(language, "usage_update_config"))
-        return
-
-    key, value_raw = raw.split(":", 1)
-    key = key.strip()
-    if not key:
-        await safe_reply(update, t(language, "config_key_missing"))
-        return
-
-    value = parse_config_value(value_raw)
-    if key == "admin_ids":
-        if not isinstance(value, list):
-            await safe_reply(update, t(language, "admin_ids_list_required"))
-            return
-        value = normalize_admin_ids(value)
-        if not value:
-            await safe_reply(update, t(language, "admin_remove_last"))
-            return
-
-    config[key] = value
-    save_config(config_path, config)
-
-    if key == "bot_token":
-        await safe_reply(update, t(language, "bot_token_updated"))
-    else:
-        await safe_reply(update, t(language, "config_updated", key=key))
+        reply_text = t(DEFAULT_LANGUAGE, "config_read_error", error=exc)
+    await safe_reply(update, reply_text)
 
 
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config_path = context.bot_data["config_path"]
+    config_lock = get_context_lock(context, CONFIG_LOCK_KEY)
+    user_id = update.effective_user.id if update.effective_user else None
     try:
-        config = load_config(config_path)
+        async with config_lock:
+            config = load_config(config_path)
+            language = get_language(config)
+            if user_id not in config.get("admin_ids", []):
+                reply_text = t(language, "no_access")
+            elif not context.args:
+                reply_text = t(language, "usage_set_language")
+            else:
+                new_language = context.args[0].strip().lower()
+                if new_language not in SUPPORTED_LANGUAGES:
+                    reply_text = t(
+                        language,
+                        "language_unsupported",
+                        language=new_language,
+                    )
+                else:
+                    config["language"] = new_language
+                    save_config(config_path, config)
+                    reply_text = t(
+                        new_language,
+                        "language_set",
+                        language=new_language,
+                    )
     except Exception as exc:
         logging.exception("Failed to load config")
-        await safe_reply(update, t(DEFAULT_LANGUAGE, "config_read_error", error=exc))
-        return
-
-    language = get_language(config)
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id not in config.get("admin_ids", []):
-        await safe_reply(update, t(language, "no_access"))
-        return
-
-    if not context.args:
-        await safe_reply(update, t(language, "usage_set_language"))
-        return
-
-    new_language = context.args[0].strip().lower()
-    if new_language not in SUPPORTED_LANGUAGES:
-        await safe_reply(update, t(language, "language_unsupported", language=new_language))
-        return
-
-    config["language"] = new_language
-    save_config(config_path, config)
-    await safe_reply(update, t(new_language, "language_set", language=new_language))
+        reply_text = t(DEFAULT_LANGUAGE, "config_read_error", error=exc)
+    await safe_reply(update, reply_text)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1337,12 +1548,20 @@ async def auto_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logging.warning("Auto-check skipped: channel or rss_url not set.")
         return
 
+    publish_lock = get_context_lock(context, PUBLISH_LOCK_KEY)
+    config_lock = get_context_lock(context, CONFIG_LOCK_KEY)
+    if publish_lock.locked():
+        logging.info("Auto-check skipped: another publication is in progress.")
+        return
+
     try:
         count = await publish_new_entries(
             context.bot,
             config,
             config_path,
             process_all=False,
+            publish_lock=publish_lock,
+            config_lock=config_lock,
         )
         if count:
             logging.info("Auto-check published %s new entries.", count)
